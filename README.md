@@ -96,6 +96,28 @@ The daemon creates a config file at `~/.clipboard-vault/config.json` on first ru
 
 Add any app names to `excludedApps` to prevent their clipboard data from being saved.
 
+## Importing Raycast's built-in clipboard history
+
+Migrate your existing Raycast clipboard history (text, links, images) into the vault:
+
+1. In Raycast, run **Export Settings & Data** and save the `.rayconfig` (note the export password).
+2. Stop the daemon:
+   ```sh
+   launchctl bootout gui/$(id -u)/com.kandotrun.clipboard-vault
+   ```
+3. Run the importer (Node 22+, uses the built-in `node:sqlite`):
+   ```sh
+   node scripts/import-raycast.mjs <path-to.rayconfig> --password <export-password>
+   ```
+   Options: `--dry-run` (report only), `--no-images` (skip images).
+4. Restart the daemon:
+   ```sh
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kandotrun.clipboard-vault.plist
+   ```
+
+Duplicates are skipped (text uses the same hash as the daemon), and images are copied into
+`~/.clipboard-vault/images/`. Delete the `.rayconfig` afterwards — it contains your full history.
+
 ## Architecture
 
 ```

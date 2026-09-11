@@ -129,18 +129,27 @@ function saveDb(db: Database): void {
 }
 
 function queryEntries(db: Database, search: string): ClipboardEntry[] {
-  let stmt;
-  if (search) {
-    stmt = db.prepare(
-      "SELECT id, content, content_type, source_app, content_hash, created_at, pinned FROM clipboard WHERE content LIKE $search ORDER BY pinned DESC, created_at DESC LIMIT $limit"
-    );
-    stmt.bind({ $search: `%${search}%`, $limit: PAGE_SIZE });
-  } else {
-    stmt = db.prepare(
-      "SELECT id, content, content_type, source_app, content_hash, created_at, pinned FROM clipboard ORDER BY pinned DESC, created_at DESC LIMIT $limit"
-    );
-    stmt.bind({ $limit: PAGE_SIZE });
-  }
+  const terms = search
+    .split(/[\s\u3000]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .slice(0, 10);
+
+  const columns =
+    "id, content, content_type, source_app, content_hash, created_at, pinned";
+  const order = "ORDER BY pinned DESC, created_at DESC LIMIT $limit";
+  const where = terms.map((_, i) => `content LIKE $t${i}`).join(" AND ");
+
+  const stmt = db.prepare(
+    where
+      ? `SELECT ${columns} FROM clipboard WHERE ${where} ${order}`
+      : `SELECT ${columns} FROM clipboard ${order}`,
+  );
+  const bind: Record<string, string | number> = { $limit: PAGE_SIZE };
+  terms.forEach((t, i) => {
+    bind[`$t${i}`] = `%${t}%`;
+  });
+  stmt.bind(bind);
 
   const rows: ClipboardEntry[] = [];
   while (stmt.step()) {

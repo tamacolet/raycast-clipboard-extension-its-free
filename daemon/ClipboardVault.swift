@@ -127,6 +127,13 @@ class ClipboardMonitor {
             return
         }
 
+        // Skip content marked concealed/transient by the source app (password managers)
+        let concealed = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
+        let transient = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+        if let types = pasteboard.types, types.contains(concealed) || types.contains(transient) {
+            return
+        }
+
         // Read image content (check before text — screenshots often have both)
         if let tiffData = pasteboard.data(forType: .tiff) {
             let hash = simpleHashData(tiffData)

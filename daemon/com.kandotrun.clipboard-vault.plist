@@ -6,7 +6,7 @@
     <string>com.kandotrun.clipboard-vault</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/clipboard-vault</string>
+        <string>/Users/t/.local/bin/clipboard-vault</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

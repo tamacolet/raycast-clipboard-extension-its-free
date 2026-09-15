@@ -1,6 +1,7 @@
 import Cocoa
 import SQLite3
 import Foundation
+import Vision
 
 // MARK: - SQLite Wrapper
 
@@ -17,6 +18,7 @@ class ClipboardDB {
             fatalError("Cannot open database at \(path)")
         }
         createTable()
+        ensureOcrColumn()
     }
 
     deinit {
@@ -46,6 +48,49 @@ class ClipboardDB {
         }
     }
 
+    private func ensureOcrColumn() {
+        var stmt: OpaquePointer?
+        var hasColumn = false
+        if sqlite3_prepare_v2(db, "PRAGMA table_info(clipboard)", -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let name = sqlite3_column_text(stmt, 1), String(cString: name) == "ocr_text" {
+                    hasColumn = true
+                }
+            }
+        }
+        sqlite3_finalize(stmt)
+        if !hasColumn {
+            sqlite3_exec(db, "ALTER TABLE clipboard ADD COLUMN ocr_text TEXT", nil, nil, nil)
+        }
+    }
+
+    /// Image entries not yet OCR'd (ocr_text IS NULL), newest first.
+    func pendingOcr(limit: Int) -> [(id: Int64, path: String)] {
+        let sql = "SELECT id, content FROM clipboard WHERE content_type = 'image' AND ocr_text IS NULL ORDER BY created_at DESC LIMIT ?"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        sqlite3_bind_int(stmt, 1, Int32(limit))
+        var rows: [(id: Int64, path: String)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let path = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+            rows.append((id: id, path: path))
+        }
+        return rows
+    }
+
+    @discardableResult
+    func setOcrText(id: Int64, text: String) -> Bool {
+        let sql = "UPDATE clipboard SET ocr_text = ? WHERE id = ?"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+        sqlite3_bind_text(stmt, 1, (text as NSString).utf8String, -1, nil)
+        sqlite3_bind_int64(stmt, 2, id)
+        return sqlite3_step(stmt) == SQLITE_DONE
+    }
+
     func isDuplicate(hash: String) -> Bool {
         let sql = "SELECT COUNT(*) FROM clipboard WHERE content_hash = ? ORDER BY created_at DESC LIMIT 1"
         var stmt: OpaquePointer?
@@ -58,11 +103,12 @@ class ClipboardDB {
         return false
     }
 
-    func insert(content: String, contentType: String, sourceApp: String?, hash: String) {
+    @discardableResult
+    func insert(content: String, contentType: String, sourceApp: String?, hash: String) -> Int64? {
         let sql = "INSERT INTO clipboard (content, content_type, source_app, content_hash, created_at) VALUES (?, ?, ?, ?, ?)"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
         sqlite3_bind_text(stmt, 1, (content as NSString).utf8String, -1, nil)
         sqlite3_bind_text(stmt, 2, (contentType as NSString).utf8String, -1, nil)
         if let app = sourceApp {
@@ -72,7 +118,8 @@ class ClipboardDB {
         }
         sqlite3_bind_text(stmt, 4, (hash as NSString).utf8String, -1, nil)
         sqlite3_bind_double(stmt, 5, Date().timeIntervalSince1970)
-        sqlite3_step(stmt)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { return nil }
+        return sqlite3_last_insert_rowid(db)
     }
 
     func entryCount() -> Int {
@@ -87,6 +134,31 @@ class ClipboardDB {
     }
 }
 
+// MARK: - OCR
+
+enum ImageOCR {
+    /// Recognizes text with the on-device Vision framework. Returns "" when the file is
+    /// missing or has no text, so the row is marked done and not retried forever.
+    static func recognize(path: String) -> String {
+        guard FileManager.default.fileExists(atPath: path) else { return "" }
+        return autoreleasepool {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["ja-JP", "en-US"]
+            request.usesLanguageCorrection = true
+            do {
+                try VNImageRequestHandler(url: URL(fileURLWithPath: path)).perform([request])
+            } catch {
+                print("OCR failed for \(path): \(error.localizedDescription)")
+                return ""
+            }
+            return (request.results ?? [])
+                .compactMap { $0.topCandidates(1).first?.string }
+                .joined(separator: "\n")
+        }
+    }
+}
+
 // MARK: - Clipboard Monitor
 
 class ClipboardMonitor {
@@ -95,6 +167,12 @@ class ClipboardMonitor {
     private var lastChangeCount: Int
     private let excludedApps: Set<String>
     private let pollInterval: TimeInterval = 0.5
+    private let backfillInterval: TimeInterval = 60
+    // OCR runs on this serial queue; all DB access stays on the main thread.
+    private let ocrQueue = DispatchQueue(label: "clipboard-vault.ocr", qos: .utility)
+    private var ocrInFlight = Set<Int64>()
+    private var backfillRunning = false
+    private var backfillDone = 0
 
     init(db: ClipboardDB, excludedApps: Set<String> = []) {
         self.db = db
@@ -111,7 +189,62 @@ class ClipboardMonitor {
             self?.checkClipboard()
         }
         timer.tolerance = 0.1
+        let backfillTimer = Timer.scheduledTimer(withTimeInterval: backfillInterval, repeats: true) { [weak self] _ in
+            self?.runBackfill()
+        }
+        backfillTimer.tolerance = 5
+        runBackfill()
         RunLoop.current.run()
+    }
+
+    private func enqueueOcr(id: Int64, path: String, completion: ((Bool) -> Void)? = nil) {
+        guard !ocrInFlight.contains(id) else { completion?(true); return }
+        ocrInFlight.insert(id)
+        ocrQueue.async { [weak self] in
+            let text = ImageOCR.recognize(path: path)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                let saved = self.db.setOcrText(id: id, text: text)
+                if !saved { print("OCR result could not be saved for id \(id)") }
+                self.ocrInFlight.remove(id)
+                completion?(saved)
+            }
+        }
+    }
+
+    /// OCRs image rows whose ocr_text is still NULL, one at a time, newest first.
+    /// Re-run periodically so rows reverted by the extension's whole-file write are picked up again.
+    private func runBackfill() {
+        guard !backfillRunning else { return }
+        let pending = db.pendingOcr(limit: 20).filter { !ocrInFlight.contains($0.id) }
+        guard !pending.isEmpty else {
+            if backfillDone > 0 {
+                print("OCR backfill finished (\(backfillDone) images)")
+                backfillDone = 0
+            }
+            return
+        }
+        backfillRunning = true
+        var remaining = pending
+        func next() {
+            guard !remaining.isEmpty else {
+                backfillRunning = false
+                print("OCR backfill progress: \(backfillDone) images")
+                runBackfill()
+                return
+            }
+            let row = remaining.removeFirst()
+            enqueueOcr(id: row.id, path: row.path) { [weak self] saved in
+                guard saved else {
+                    // Stop this round; the 60s timer retries, so a failing DB can't pin the CPU.
+                    self?.backfillRunning = false
+                    return
+                }
+                self?.backfillDone += 1
+                next()
+            }
+        }
+        next()
     }
 
     private func checkClipboard() {
@@ -145,7 +278,9 @@ class ClipboardMonitor {
                     let filename = "\(hash).png"
                     let filepath = imagesDir + "/" + filename
                     try? pngData.write(to: URL(fileURLWithPath: filepath))
-                    db.insert(content: filepath, contentType: "image", sourceApp: sourceApp, hash: hash)
+                    if let id = db.insert(content: filepath, contentType: "image", sourceApp: sourceApp, hash: hash) {
+                        enqueueOcr(id: id, path: filepath)
+                    }
                 }
             }
             return  // Don't also capture text representation of images
@@ -228,6 +363,7 @@ struct Config {
 
 // MARK: - Main
 
+setvbuf(stdout, nil, _IOLBF, 0)
 let config = Config.load()
 let db = ClipboardDB(path: config.dbPath)
 let monitor = ClipboardMonitor(db: db, excludedApps: config.excludedApps)

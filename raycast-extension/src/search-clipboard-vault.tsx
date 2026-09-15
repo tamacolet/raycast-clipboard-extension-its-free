@@ -25,6 +25,7 @@ interface ClipboardEntry {
   content_hash: string;
   created_at: number;
   pinned: number;
+  ocr_text: string | null;
 }
 
 interface Preferences {
@@ -135,10 +136,22 @@ function queryEntries(db: Database, search: string): ClipboardEntry[] {
     .filter(Boolean)
     .slice(0, 10);
 
-  const columns =
-    "id, content, content_type, source_app, content_hash, created_at, pinned";
+  // ocr_text is added by newer daemons; older databases don't have the column yet.
+  const hasOcr = db
+    .exec("PRAGMA table_info(clipboard)")[0]
+    ?.values.some((row: unknown[]) => row[1] === "ocr_text");
+  const columns = `id, content, content_type, source_app, content_hash, created_at, pinned, ${
+    hasOcr ? "ocr_text" : "NULL AS ocr_text"
+  }`;
   const order = "ORDER BY pinned DESC, created_at DESC LIMIT $limit";
-  const where = terms.map((_, i) => `content LIKE $t${i}`).join(" AND ");
+  // OCR lines wrap mid-word in Japanese, so match against the text with newlines removed.
+  const where = terms
+    .map((_, i) =>
+      hasOcr
+        ? `(content LIKE $t${i} OR replace(ocr_text, char(10), '') LIKE $t${i})`
+        : `content LIKE $t${i}`,
+    )
+    .join(" AND ");
 
   const stmt = db.prepare(
     where
@@ -169,7 +182,8 @@ function getDetailMarkdown(entry: ClipboardEntry): string {
   const metaLine = `\`${metaParts.join(" · ")}\``;
 
   if (entry.content_type === "image") {
-    return `![clipboard image](file://${entry.content})\n\n---\n${metaLine}`;
+    const ocr = entry.ocr_text ? `\n\n\`\`\`\n${entry.ocr_text}\n\`\`\`` : "";
+    return `![clipboard image](file://${entry.content})${ocr}\n\n---\n${metaLine}`;
   }
   if (entry.content_type === "url") {
     return `[${entry.content}](${entry.content})\n\n---\n${metaLine}`;
@@ -351,7 +365,13 @@ export default function SearchClipboardVault() {
               <List.Item
                 key={entry.id}
                 icon={entry.pinned ? Icon.Pin : getIcon(entry.content_type)}
-                title={entry.content_type === "image" ? "Image" : truncateContent(entry.content)}
+                title={
+                  entry.content_type === "image"
+                    ? entry.ocr_text
+                      ? truncateContent(entry.ocr_text)
+                      : "Image"
+                    : truncateContent(entry.content)
+                }
                 accessories={[{ text: subtitle }]}
                 detail={
                   <List.Item.Detail markdown={getDetailMarkdown(entry)} />
@@ -392,6 +412,17 @@ export default function SearchClipboardVault() {
                         await bumpEntry(entry.id);
                       }}
                     />
+                    {entry.content_type === "image" && entry.ocr_text && (
+                      <Action
+                        title="Copy OCR Text"
+                        icon={Icon.Text}
+                        shortcut={{ modifiers: ["cmd", "shift"], key: "t" }}
+                        onAction={async () => {
+                          await Clipboard.copy(entry.ocr_text ?? "");
+                          await showToast({ style: Toast.Style.Success, title: "OCR text copied" });
+                        }}
+                      />
+                    )}
                     {entry.content_type === "url" && (
                       <Action.OpenInBrowser
                         title="Open in Browser"

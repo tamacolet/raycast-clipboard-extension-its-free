@@ -4,6 +4,12 @@
 
 No subscriptions. No Raycast Pro. No cloud. Just a Swift daemon that watches your clipboard and a Raycast extension to search and paste.
 
+> This fork of [kandotrun/raycast-clipboard-extension-its-free](https://github.com/kandotrun/raycast-clipboard-extension-its-free) adds **text search inside images (on-device OCR)**, **multi-keyword AND search**, and an importer for Raycast's built-in clipboard history.
+
+| Search text inside images | Multi-keyword AND search |
+|---|---|
+| ![OCR search](docs/ocr-search.jpg) | ![AND search](docs/and-search.jpg) |
+
 ## What is this?
 
 Raycast's built-in clipboard history is limited unless you pay $10/month for Raycast Pro. This project gives you **unlimited clipboard history** for free:
@@ -16,6 +22,8 @@ Raycast's built-in clipboard history is limited unless you pay $10/month for Ray
 - ♾️ **Unlimited history** — No cap on entries, ever
 - 🖼️ **Image support** — Screenshots and copied images saved as PNG with preview
 - 🔍 **Full-text search** — Find anything you've ever copied
+- 🔎 **Search text inside images** — Screenshots and copied images are OCR'd on-device with Apple Vision (Japanese + English), so their text is searchable too
+- ➕ **Multi-keyword AND search** — `iphone17 tama` matches entries containing both words (space or full-width space separated)
 - 📌 **Pin entries** — Keep important items at the top
 - 🏷️ **Auto-detect content type** — URLs, emails, file paths, images, plain text
 - 📱 **Source app tracking** — Know where you copied from
@@ -29,7 +37,7 @@ Raycast's built-in clipboard history is limited unless you pay $10/month for Ray
 
 ```bash
 cd daemon
-swiftc ClipboardVault.swift -o clipboard-vault -framework Cocoa -framework Foundation -O
+swiftc ClipboardVault.swift -o clipboard-vault -framework Cocoa -framework Foundation -framework Vision -O
 ```
 
 ### 2. Install the daemon
@@ -75,6 +83,12 @@ Go to **Raycast Settings → Extensions → Clipboard Vault → Search Clipboard
 | Pin / Unpin | `⌘⇧P` |
 | Delete entry | `⌘ Delete` |
 
+## Search
+
+- Separate keywords with spaces (half- or full-width). Every keyword must match — e.g. `iphone17 tama`.
+- Keywords match both the copied text and the OCR text of images. Line breaks in OCR text are ignored when matching, so words that wrap across lines in a screenshot are still found.
+- Image entries use the first OCR line as their title and show the full OCR text under the preview. `⌘⇧T` copies the OCR text.
+
 ## Image Support
 
 The daemon captures images from the clipboard (screenshots, copied images) and saves them as PNG files to `~/.clipboard-vault/images/`. The Raycast extension shows image previews in the detail panel and lets you copy images back to the clipboard.
@@ -82,6 +96,8 @@ The daemon captures images from the clipboard (screenshots, copied images) and s
 - Images are checked before text (screenshots often set both)
 - Duplicate detection uses a hash of the first 8KB + total size
 - Images are stored as PNG regardless of the original format
+- Each image is OCR'd right after capture using the Vision framework, fully offline. The result is stored in the `ocr_text` column
+- Existing images without OCR text are backfilled in the background, newest first (about 1s per image), and re-checked every 60 seconds
 
 ## Configuration
 
@@ -156,7 +172,7 @@ rm -rf ~/.clipboard-vault
 
 ## Requirements
 
-- macOS 12+
+- macOS 13+ (Japanese OCR requires the macOS 13 Vision text recognizer)
 - Swift (included with Xcode or Command Line Tools)
 - Node.js 18+ (for building the Raycast extension)
 - [Raycast](https://raycast.com/) (free tier is fine!)
